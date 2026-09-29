@@ -2,15 +2,16 @@ apiVersion: 1
 
 # File-provisioned Grafana alert rule for the Order Tracker 5xx incident.
 #
-# The query ends in `or vector(0)` on purpose: a Prometheus counter creates no
-# series until a 5xx actually happens, so without the fallback the evaluation
-# returns no data points during quiet periods. noDataState and execErrState are
-# also pinned to OK so the responder is never woken by an empty window or a
-# backend hiccup — the assignment calls this out as "handle periods with no 5xx
-# responses".
+# There is deliberately no `or vector(0)` fallback here. A Prometheus counter
+# creates no series at all until a 5xx actually happens, so in a quiet window the
+# query legitimately returns nothing; `noDataState: OK` below already turns that
+# into a calm Normal state. The fallback that used to sit at the end of the
+# expression added a *second* series with no labels at all, which then produced a
+# permanent phantom alert instance whose `{{ $labels.http_route }}` annotation
+# rendered as the literal text "[no value]". See issue #9.
 #
 # Metric label names are the OTLP-normalized ones the collector publishes:
-# http_response_status_code, http_route, service_name.
+# http_response_status_code, http_request_method, http_route, service_name.
 
 groups:
   - orgId: 1
@@ -56,7 +57,7 @@ groups:
               expr: >-
                 sum by (http_route) (
                   increase(http_requests_total{http_response_status_code=~"5.."}[5m])
-                ) or vector(0)
+                )
               instant: true
               intervalMs: 1000
               maxDataPoints: 43200
