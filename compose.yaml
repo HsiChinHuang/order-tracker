@@ -8,37 +8,162 @@ services:
       - "127.0.0.1:${ORDER_TRACKER_PORT:-8000}:8000"
     environment:
       ORDER_DB_PATH: /data/orders.db
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      # The app uses gRPC OTLP exporters, so this must point at 4317; 4318 is
+      # the HTTP listener and silently drops gRPC traffic.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       OTEL_ENVIRONMENT: development
       DEPLOYED_VERSION: local
     volumes:
       - orders:/data
+      # The app source is bind-mounted, so a patch written by the responder into
+      # ./app is what the container imports on its next start. `--reload` is not
+      # used: inotify does not fire across a Docker Desktop Windows mount, so a
+      # hot-reload there would look configured and never trigger. Recovery is
+      # `docker compose restart app`, which is also what the assignment asks for.
+      - ./app:/app/app
+    command:
+      [
+        "uv", "run", "--no-sync", "uvicorn", "app.main:app",
+        "--host", "0.0.0.0", "--port", "8000",
+      ]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
       interval: 5s
       timeout: 3s
+      retries: 24
+      start_period: 20s
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    command: ["--config=/etc/otelcol-contrib/otel-collector-config.yaml"]
+    volumes:
+      - ./observability/otel-collector-config.yaml:/etc/otelcol-contrib/otel-collector-config.yaml:ro
+    expose:
+      - "4317"
+      - "4318"
+    ports:
+      - "127.0.0.1:${COLLECTOR_PROM_PORT:-8889}:8889"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./observability/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yaml"
+      - "--storage.tsdb.path=/prometheus"
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.3.2
+    volumes:
+      - ./observability/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "127.0.0.1:${LOKI_PORT:-3100}:3100"
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    volumes:
+      - ./observability/tempo-config.yaml:/etc/tempo-config.yaml:ro
+      - tempo-data:/var/tempo
+    command: ["-config.file=/etc/tempo-config.yaml"]
+    ports:
+      - "127.0.0.1:${TEMPO_PORT:-3200}:3200"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    environment:
+      # Local development credential only. Bound to 127.0.0.1 below.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+      - GF_ALERTING_ENABLED=true
+      - GF_UNIFIED_ALERTING_ENABLED=true
+      # Lets alert notifications build absolute dashboard links.
+      - GF_SERVER_ROOT_URL=http://localhost:${GRAFANA_PORT:-3000}
+      - GF_NEWS_V2=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
       retries: 12
     depends_on:
-      - otel-collector
+      - prometheus
+      - loki
+      - tempo
 
   responder:
     build:
-      context: .
-      dockerfile: Dockerfile.responder
+      context: ./incident-response
+      dockerfile: Dockerfile
     ports:
-      - "127.0.0.1:8001:8001"
+      - "127.0.0.1:${RESPONDER_PORT:-8001}:8001"
     environment:
-      INCIDENTS_DIR: /incidents
+      RESOLVER_PORT: "8001"
+      RESOLVER_DATA_DIR: /incidents
+      APP_BASE_URL: http://app:8000
+      PROMETHEUS_URL: http://prometheus:9090
+      LOKI_URL: http://loki:3100
+      TEMPO_URL: http://tempo:3200
+      REPO_DIR: /work/repo
+      AGENT_CMD: pi
+      AGENT_TOOLS: read,grep,find,ls,edit
+      PI_PROVIDER: ${PI_PROVIDER:-}
+      PI_MODEL: ${PI_MODEL:-}
+      # Mounted read-only at /opt/pi-agent and copied to a writable location by
+      # entrypoint.sh: pi rewrites settings.json.lock and sessions at startup,
+      # and on a read-only mount it fails to load models.json at all and then
+      # reports a missing API key that is actually present.
+      PI_AGENT_MOUNT: /opt/pi-agent
+      PI_CODING_AGENT_SESSION_DIR: /tmp/pi-sessions
+      PI_SKIP_VERSION_CHECK: "1"
+      PI_TELEMETRY: "0"
     volumes:
       - incidents:/incidents
-      - ./incident-response:/app/incident-response
+      # The responder edits this checkout; recovery then needs `docker compose
+      # restart app` because the app is not hot-reloading across a Windows
+      # bind mount. See scripts/ for the reproduce/restore pair.
+      - .:/work/repo
+      # Pi reads its model credentials from here. Compose fails with a clear
+      # message instead of a silently broken mount when it is unset.
+      - ${PI_AGENT_DIR:?set PI_AGENT_DIR to your pi config dir, e.g. C:/Users/you/.pi/agent}:/opt/pi-agent:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8001/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
     depends_on:
       - app
 
 volumes:
   orders:
   incidents:
+  prometheus-data:
+  loki-data:
+  tempo-data:
+  grafana-data:
 
 networks:
   default:

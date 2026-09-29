@@ -1,0 +1,17 @@
+apiVersion: 1
+
+# The whole notification policy tree is one resource: provisioning it replaces
+# every policy in the tree, so the root has to be declared here.
+
+policies:
+  - orgId: 1
+    receiver: webhook-notifier
+    group_by:
+      - alertname
+      - http_route
+    group_wait: 10s
+    group_interval: 1m
+    # 1m rather than the usual hours: this stack is a demo of one incident, and a
+    # long repeat interval means a responder that restarted mid-incident sees no
+    # further webhook for a very long time. In production raise this back up.
+    repeat_interval: 1m

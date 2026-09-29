@@ -1,32 +1,44 @@
 server:
   http_listen_port: 3200
+  grpc_listen_port: 9095
 
 distributor:
   receivers:
     otlp:
       protocols:
         grpc:
+          endpoint: 0.0.0.0:4317
         http:
+          endpoint: 0.0.0.0:4318
 
 ingester:
-  lifecycler:
-    address: 127.0.0.1
-    ring:
-      kvstore:
-        store: inmemory
-      replication_factor: 1
-    final_sleep: 0s
-  chunk_idle_period: 5m
-  chunk_retain_period: 30s
+  trace_idle_period: 10s
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    compacted_block_retention: 1h
 
 storage:
-  tracing:
+  # The key is storage.trace. With storage.tracing the backend is silently
+  # unset and Tempo accepts spans but stores nothing queryable.
+  trace:
     backend: local
+    wal:
+      path: /var/tempo/wal
     local:
-      path: /tmp/tempo/blocks
+      path: /var/tempo/blocks
 
-tracing:
-  response_cache:
-    local:
-      max_size_items: 100
-      validity: 10m
+# Generated (service-graph) metrics are not needed for this exercise, so the
+# metrics_generator block is left out on purpose. Its storage section uses the
+# key `store`, not the `backend` key that storage.trace uses; guessing wrong
+# makes Tempo reject the config and crash-loop.
+# metrics_generator:
+#   storage:
+#     store: local
+#     local:
+#       path: /var/tempo/generator
+
+querier:
+  search:
+    external_hedge_requests_up_to: 1

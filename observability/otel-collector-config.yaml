@@ -2,43 +2,54 @@ receivers:
   otlp:
     protocols:
       grpc:
-        endpoint: "0.0.0.0:4317"
+        endpoint: 0.0.0.0:4317
       http:
-        endpoint: "0.0.0.0:4318"
+        endpoint: 0.0.0.0:4318
 
 processors:
-  batch:
+  batch: {}
   memory_limiter:
     check_interval: 1s
-    limit_mib: 500
+    limit_mib: 400
+    spike_limit_mib: 100
 
 exporters:
+  # Pull-based: Prometheus scrapes the collector on :8889. This is the path the
+  # Grafana alert rule reads, so it is the one that must stay healthy.
+  # The app's counter is named "http.requests"; the exporter normalizes it to
+  # http_requests_total, which is what the dashboard and alert rule query.
   prometheus:
-    endpoint: "0.0.0.0:8889"
-  otlp/prometheus:
-    endpoint: "prometheus:9090"
+    endpoint: 0.0.0.0:8889
+    send_timestamps: true
+    metric_expiration: 30m
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  otlp/traces:
+    endpoint: tempo:4317
     tls:
       insecure: true
-  loki:
-    endpoint: "http://loki:3100/loki/api/v1/push"
-  otlp/tempo:
-    endpoint: "tempo:4317"
+
+  # Loki 3.x serves an OTLP receiver at /otlp/v1/logs on its HTTP port.
+  otlphttp/logs:
+    endpoint: http://loki:3100/otlp
     tls:
       insecure: true
+
   debug:
-    verbosity: detailed
+    verbosity: normal
 
 service:
   pipelines:
     metrics:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [prometheus, debug]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
     traces:
       receivers: [otlp]
-      processors: [batch, memory_limiter]
-      exporters: [otlp/tempo, debug]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/traces]
     logs:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [loki, debug]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/logs]

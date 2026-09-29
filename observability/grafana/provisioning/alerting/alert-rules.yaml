@@ -1,0 +1,85 @@
+apiVersion: 1
+
+# File-provisioned Grafana alert rule for the Order Tracker 5xx incident.
+#
+# The query ends in `or vector(0)` on purpose: a Prometheus counter creates no
+# series until a 5xx actually happens, so without the fallback the evaluation
+# returns no data points during quiet periods. noDataState and execErrState are
+# also pinned to OK so the responder is never woken by an empty window or a
+# backend hiccup — the assignment calls this out as "handle periods with no 5xx
+# responses".
+#
+# Metric label names are the OTLP-normalized ones the collector publishes:
+# http_response_status_code, http_route, service_name.
+
+groups:
+  - orgId: 1
+    name: order-tracker
+    folder: order-tracker
+    interval: 30s
+    rules:
+      - uid: order-tracker-5xx
+        title: OrderTracker5xxErrors
+        condition: B
+        for: 0s
+        noDataState: OK
+        execErrState: OK
+        # Deep link from the notification into the panel that detected this.
+        dashboardUid: order-tracker-dashboard
+        panelId: 2
+        labels:
+          severity: critical
+          service: order-tracker
+        annotations:
+          summary: "5xx responses observed on {{ $labels.http_route }}"
+          description: >-
+            {{ $values.B }} 5xx responses in the last 5 minutes.
+            Endpoint: {{ $labels.http_route }}.
+          endpoint: "{{ $labels.http_route }}"
+          time_window: "5m increase, evaluated every 30s"
+          runbook: "runbooks/verify-recovery.sh"
+          owner: "oncall"
+          # annotations are exempt from provisioning's $variable interpolation,
+          # so {{ $labels }} survives into the notification untouched.
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: Prometheus
+            model:
+              refId: A
+              datasource:
+                type: prometheus
+                uid: Prometheus
+              editorMode: code
+              expr: >-
+                sum by (http_route) (
+                  increase(http_requests_total{http_response_status_code=~"5.."}[5m])
+                ) or vector(0)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              queryType: instant
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              conditions:
+                - type: math
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  evaluator:
+                    type: gt
+                    params:
+                      - 0
+              intervalMs: 1000
+              maxDataPoints: 43200
