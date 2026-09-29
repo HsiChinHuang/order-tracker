@@ -1,0 +1,33 @@
+autonomy_level: 2
+
+allowlist:
+  allowed_commands:
+    - pytest
+    - git add
+    - git commit
+    - git push --force-with-lease
+    - docker compose up --build -d --wait
+    - docker compose restart app
+    - curl http://localhost:8000/healthz
+    - curl http://localhost:9090/api/v1/query
+    - curl http://localhost:8000/api/orders/*
+
+  allowed_files:
+    read:
+      - "app/*.py"
+      - "tests/*.py"
+      - "observability/*.yaml"
+    write:
+      - "app/*.py"
+      - "tests/*.py"
+
+escalation:
+  conditions:
+    - "action requires database schema change"
+    - "action requires credential rotation"
+    - "responder cannot identify root cause within 3m"
+    - "proposed fix causes test failures"
+    - "autonomy level >= 4"
+  notify:
+    - channel: "#oncall"
+    - method: "webhook"

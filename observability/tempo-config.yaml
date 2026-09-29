@@ -1,0 +1,32 @@
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+        http:
+
+ingester:
+  lifecycler:
+    address: 127.0.0.1
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+    final_sleep: 0s
+  chunk_idle_period: 5m
+  chunk_retain_period: 30s
+
+storage:
+  tracing:
+    backend: local
+    local:
+      path: /tmp/tempo/blocks
+
+tracing:
+  response_cache:
+    local:
+      max_size_items: 100
+      validity: 10m

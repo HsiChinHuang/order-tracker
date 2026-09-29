@@ -1,0 +1,15 @@
+apiVersion: 1
+
+notifiers:
+  - name: webhook-notifier
+    type: webhook
+    uid: webhook_alert
+    is_default: false
+    secure_fields: {}
+    settings:
+      url: http://responder:8001/alerts
+      contentType: application/json
+
+notification_policies:
+  - org_id: 1
+    receiver: webhook-notifier

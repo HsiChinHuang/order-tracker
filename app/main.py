@@ -7,11 +7,61 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from opentelemetry import metrics, trace
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.logging import LoggingInstrumentor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import (
+    ConsoleMetricExporter,
+    PeriodicExportingMetricReader,
+)
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.requests import Request
 
 
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
 STATUSES = {"received", "preparing", "shipped", "delivered"}
+
+# --- OpenTelemetry setup ---
+ENVIRONMENT = os.getenv("OTEL_ENVIRONMENT", "development")
+DEPLOYED_VERSION = os.getenv("DEPLOYED_VERSION", "local")
+
+resource = Resource.create({
+    "service.name": "order-tracker",
+    "service.version": DEPLOYED_VERSION,
+    "environment": ENVIRONMENT,
+})
+
+# Traces: export to console (and OTLP collector endpoint if available)
+trace_provider = TracerProvider(resource=resource)
+trace_exporter = OTLPSpanExporter() if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") else ConsoleSpanExporter()
+trace_provider.add_span_processor(BatchSpanProcessor(trace_exporter))
+trace.set_tracer_provider(trace_provider)
+
+# Metrics: export to console via OTLP
+metric_exporter = (
+    OTLPMetricExporter() if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") else ConsoleMetricExporter()
+)
+metric_reader = PeriodicExportingMetricReader(metric_exporter)
+meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+metrics.set_meter_provider(meter_provider)
+
+# Structured logging with trace context
+LoggingInstrumentor().instrument()
+
+tracer = trace.get_tracer("order-tracker")
+meter = metrics.get_meter("order-tracker")
+request_counter = meter.create_counter(
+    "http.requests",
+    unit="1",
+    description="Counts HTTP requests by method, route, and status",
+)
 
 
 def connect():
@@ -55,7 +105,7 @@ def order_detail(row):
     order = as_dict(row)
     if order["priority"] == "express":
         placed_at = datetime.fromisoformat(order["created_at"])
-        estimated_at = placed_at.replace(day=placed_at.day + 2)
+        estimated_at = placed_at + timedelta(days=2)
         order["estimated_delivery"] = estimated_at.date().isoformat()
     return order
 
@@ -77,6 +127,25 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Order Tracker", lifespan=lifespan)
+
+
+# --- Custom middleware to emit request metrics with route and status ---
+class MetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+        response = await call_next(request)
+        route = request.url.path
+        method = request.method
+        status_code = response.status_code
+        request_counter.add(1, {
+            "http.method": method,
+            "http.route": route,
+            "http.status_code": status_code,
+        })
+        return response
+
+
+app.add_middleware(MetricsMiddleware)
+FastAPIInstrumentor.instrument_app(app)
 
 
 @app.get("/")

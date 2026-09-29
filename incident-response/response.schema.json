@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ResponderOutput",
+  "description": "Structured output from the incident responder agent",
+  "type": "object",
+  "required": ["summary", "root_cause", "action", "status"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "Brief summary of what happened"
+    },
+    "root_cause": {
+      "type": "string",
+      "description": "The identified root cause of the incident"
+    },
+    "action": {
+      "type": "string",
+      "enum": ["fix", "rollback", "false_positive", "escalate"],
+      "description": "The recommended or taken action"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["resolved", "pending", "escalated"],
+      "description": "The current status of the incident"
+    },
+    "details": {
+      "type": "string",
+      "description": "Additional details about the investigation and fix"
+    },
+    "fix_commit_message": {
+      "type": "string",
+      "description": "Git commit message for the fix (if action is 'fix')"
+    }
+  },
+  "additionalProperties": false
+}
