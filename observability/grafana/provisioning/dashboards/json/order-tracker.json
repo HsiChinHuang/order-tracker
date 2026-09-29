@@ -92,8 +92,8 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "sum by (status_code) (rate(http_requests_total[5m]))",
-          "legendFormat": "{{status_code}}",
+          "expr": "sum by (http_response_status_code) (rate(http_requests_total[$__rate_interval]))",
+          "legendFormat": "{{http_response_status_code}}",
           "refId": "A"
         }
       ]
@@ -182,8 +182,8 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "sum by (status_code) (rate(http_requests_total{status_code=~\"5..\"}[5m]))",
-          "legendFormat": "{{status_code}}",
+          "expr": "sum by (http_response_status_code) (rate(http_requests_total{http_response_status_code=~\"5..\"}[$__rate_interval]))",
+          "legendFormat": "{{http_response_status_code}}",
           "refId": "A"
         }
       ]
@@ -272,7 +272,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "sum by (http_route) (rate(http_requests_total[5m]))",
+          "expr": "sum by (http_route) (rate(http_requests_total[$__rate_interval]))",
           "legendFormat": "{{http_route}}",
           "refId": "A"
         }
@@ -342,7 +342,10 @@
   ],
   "refresh": "30s",
   "schemaVersion": 39,
-  "tags": ["order-tracker", "observability"],
+  "tags": [
+    "order-tracker",
+    "observability"
+  ],
   "templating": {
     "list": [
       {

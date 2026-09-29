@@ -25,6 +25,9 @@ datasources:
     url: http://tempo:3200
     editable: true
     jsonData:
+      # Turns the trace_id carried on each log record into a clickable link into
+      # Tempo. matcherRegex runs over the log line and its structured metadata, so
+      # trace_id does not have to be a stream label for this to work.
       tracesToLogsV2:
         datasourceUid: Loki
       tracesToMetrics:
