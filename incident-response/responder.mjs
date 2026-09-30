@@ -12,6 +12,9 @@ import { spawn } from "node:child_process";
 import { mkdir, writeFile, readdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import http from "node:http";
 
 const PORT = Number(process.env.RESOLVER_PORT || 8001);
@@ -103,7 +106,6 @@ async function loadExistingIncidents() {
     });
   }
 }
-await loadExistingIncidents();
 
 // Grafana re-notifies a still-firing alert every repeat_interval, and the policy
 // tree here uses 1m so the loop is observable in one sitting. Without this guard
@@ -411,7 +413,7 @@ async function snapshotTree(root) {
   return out;
 }
 
-function diffTrees(before, after) {
+export function diffTrees(before, after) {
   const changed = [];
   const added = [];
   const removed = [];
@@ -423,7 +425,7 @@ function diffTrees(before, after) {
   return { changed, added, removed };
 }
 
-function classifyWriteScope(diff) {
+export function classifyWriteScope(diff) {
   const touched = [...diff.changed, ...diff.added, ...diff.removed];
   const outside = touched.filter((p) => !p.startsWith(WRITE_ALLOW_PREFIX));
   return { allowed: touched.filter((p) => p.startsWith(WRITE_ALLOW_PREFIX)), outside, touched };
@@ -434,7 +436,7 @@ function classifyWriteScope(diff) {
 // validate JSON, and response.schema.json was never read by anything. Parse the
 // line and build the schema object here, so the schema describes what the
 // responder produces instead of what nobody sends.
-function parseVerdict(text) {
+export function parseVerdict(text) {
   const lines = String(text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i--) {
     const m = lines[i].match(/^VERDICT:\s*(fixed|no-action|needs-human)\s*-\s*(.+)$/i);
@@ -521,10 +523,11 @@ function recoveryProblem(recovery) {
 // Single definition of "the incident is over": the check ran, nothing answered
 // 5xx, AND nothing failed to answer. Used by the response object, the record and
 // the API so the three can never disagree.
-function isRecovered(recovery) {
+export function isRecovered(recovery) {
   return Boolean(
     recovery &&
       recovery.verified &&
+      (recovery.results || []).length > 0 &&
       (recovery.still_failing || []).length === 0 &&
       (recovery.unreachable || []).length === 0,
   );
@@ -627,7 +630,8 @@ const json = (res, code, payload) => {
   res.end(JSON.stringify(payload, null, 2));
 };
 
-const server = http.createServer(async (req, res) => {
+// Exported so a test can assert that importing this module does NOT start it.
+export const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (req.method === "GET" && url.pathname === "/healthz") {
@@ -777,8 +781,19 @@ const server = http.createServer(async (req, res) => {
   json(res, 404, { detail: "Not found" });
 });
 
-await mkdir(DATA_DIR, { recursive: true });
-loadInflight();
+export const WRITE_ALLOW_PREFIX_FOR_TESTS = WRITE_ALLOW_PREFIX;
+export async function snapshotTreeForTests(root) {
+  return snapshotTree(root);
+}
+
+// Boot side effects live behind a main-module guard. Importing this file to test
+// the decision functions must not read the incidents volume, log to /dev/stdout or
+// bind :8001 -- without this, `node --test` would fight the running responder for
+// the port and rebuild incident state as a side effect of a unit test.
+async function boot() {
+  await mkdir(DATA_DIR, { recursive: true });
+  loadInflight();
+  await loadExistingIncidents();
 
 // .env values are interpolated by compose at `up` time, and an ambient shell
 // variable of the same name silently overrides them -- an incident was
@@ -842,6 +857,25 @@ loadInflight();
   log(`incidents rebuilt from ${DATA_DIR}: ${incidents.size}`);
 }
 
-server.listen(PORT, "0.0.0.0", () =>
-  log(`listening on :${PORT} agent=${AGENT_CMD} repo=${REPO_DIR}`),
-);
+  server.listen(PORT, "0.0.0.0", () =>
+    log(`listening on :${PORT} agent=${AGENT_CMD} repo=${REPO_DIR}`),
+  );
+}
+
+if (isMainModule()) {
+  await boot();
+}
+
+// Robust across node 18 (host) and node 24 (container), and across being invoked
+// as `node responder.mjs`, `node ./incident-response/responder.mjs` or as the
+// entry of `node --test <dir>`, where argv[1] may be a relative path that
+// fileURLToPath() rejects outright.
+function isMainModule() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(resolve(entry)) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
