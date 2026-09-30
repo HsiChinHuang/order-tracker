@@ -9,6 +9,37 @@ scrape_configs:
   - job_name: otel-collector
     static_configs:
       - targets: ["otel-collector:8889"]
+    # Prometheus labels describe the scrape target, so every app series arrived
+    # as job="otel-collector" while the app's own identity arrived as
+    # exported_job="order-tracker" / exported_instance="<uuid>". Two competing
+    # identity label sets meant `sum by (job)` silently grouped app traffic under
+    # the collector. Decision: for app metrics, job/instance ARE the app's, and
+    # the exported_ copies are dropped as redundant.
+    #
+    # Verified on live data (promtool check config passes; config confirmed loaded
+    # via /api/v1/status/config). In a window containing only post-restart
+    # samples, every http_requests_total series is job="order-tracker" /
+    # instance=<uuid> with no exported_* left. Before the fix, sum by (job)
+    # reported all app traffic as job="otel-collector"; it now separates
+    # order-tracker from otel-collector.
+    #
+    # Caveat kept honest: this collector publishes NO self-metrics on :8889
+    # (a scrape of otel-collector:8889/metrics contains zero otelcol_* series),
+    # so the branch that preserves exported_* for collector self-metrics is
+    # untestable here and is written defensively, not verified.
+    metric_relabel_configs:
+      - source_labels: [exported_job]
+        regex: "(.+)"
+        target_label: job
+        replacement: "$1"
+        action: replace
+      - source_labels: [exported_instance]
+        regex: "(.+)"
+        target_label: instance
+        replacement: "$1"
+        action: replace
+      - regex: "exported_(job|instance)"
+        action: labeldrop
 
   - job_name: prometheus
     static_configs:
