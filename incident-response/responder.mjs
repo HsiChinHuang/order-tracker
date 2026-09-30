@@ -23,6 +23,10 @@ const TEMPO_URL = process.env.TEMPO_URL || "http://tempo:3200";
 const REPO_DIR = process.env.REPO_DIR || "/work/repo";
 const AGENT_CMD = process.env.AGENT_CMD || "pi";
 const AGENT_TOOLS = process.env.AGENT_TOOLS || "read,grep,find,ls,edit";
+// Filled in at boot from the environment the agent will actually inherit, and
+// served by /healthz so "which model answered this incident?" is answerable from
+// outside the container. Nulls mean the values were never pinned.
+let AGENT_MODEL_IN_USE = { provider: null, model: null };
 const AGENT_TIMEOUT_MS = Number(process.env.AGENT_TIMEOUT_MS || 900000);
 const MAX_BODY = 2 * 1024 * 1024;
 
@@ -61,9 +65,18 @@ async function loadExistingIncidents() {
     const recovery = read("recovery.json");
     if (!alert && !recovery) continue; // not an incident dir
     let agentFinished = false;
+    let agentText = "";
     try {
-      agentFinished = readFileSync(`${dir}/agent_response.md`, "utf8").trim().length > 0;
+      agentText = readFileSync(`${dir}/agent_response.md`, "utf8");
+      agentFinished = agentText.trim().length > 0;
     } catch {}
+    // Re-derive verdict and write scope from the artifacts rather than trusting
+    // recovery.json, which older builds rewrote with only two keys after a
+    // POST /verify. A rebuilt record missing these would make the next re-verify
+    // conclude "no verdict line" and escalate an incident that had already been
+    // fixed and confirmed.
+    const verdict = agentFinished ? parseVerdict(agentText) : null;
+    const writeScope = read("write-scope.json");
     incidents.set(name, {
       status: recovery
         ? recovery.recovered
@@ -82,6 +95,10 @@ async function loadExistingIncidents() {
       alert,
       recovered: recovery?.recovered,
       recovery: recovery?.recovery,
+      verdict,
+      writeScope: writeScope
+        ? { outside: writeScope.outside || [], touched: writeScope.touched || [] }
+        : { outside: [], touched: [] },
       rebuiltFromDisk: true,
     });
   }
@@ -98,6 +115,49 @@ const COOLDOWN_MS = Number(process.env.AGENT_COOLDOWN_MS || 15 * 60 * 1000);
 function dedupeKey(alert) {
   const l = alert.labels || {};
   return `${l.alertname || "alert"}|${l.http_route || l.http_route || "no-route"}`;
+}
+
+// The cooldown guard has to survive a restart, otherwise a still-firing alert
+// launches a fresh agent the moment the responder comes back up -- which is how a
+// second full agent run got paid for during earlier testing (issue #8 checkpoint
+// 3). "agent already running" cannot survive a restart honestly: the process died
+// with the container. What gets persisted is lastStarted, and an interrupted run
+// is remembered as such, so the guard reads "investigated Ns ago" rather than
+// pretending an agent is alive.
+const INFLIGHT_FILE = `${DATA_DIR}/inflight.json`;
+
+function loadInflight() {
+  try {
+    const raw = JSON.parse(readFileSync(INFLIGHT_FILE, "utf8"));
+    for (const [key, v] of Object.entries(raw)) {
+      if (v?.running) {
+        inflight.set(key, { ...v, running: false, interrupted: true });
+        log(`cooldown: ${key} had an agent running when the responder last stopped; treating as investigated ${v.incidentId || "?"}`);
+      } else if (v && typeof v.lastStarted === "number") {
+        inflight.set(key, v);
+      }
+    }
+    if (inflight.size) log(`cooldown state loaded: ${inflight.size} key(s)`);
+  } catch {
+    // first run, or the volume was wiped
+  }
+}
+
+let saveInflightQueued = null;
+async function saveInflight() {
+  // Coalesce bursts of writes; the file is tiny and only read at boot.
+  if (saveInflightQueued) return saveInflightQueued;
+  saveInflightQueued = (async () => {
+    const payload = Object.fromEntries(inflight);
+    try {
+      await writeFile(INFLIGHT_FILE, JSON.stringify(payload, null, 2));
+    } catch (e) {
+      log(`WARNING: could not persist cooldown state: ${e.message}`);
+    } finally {
+      saveInflightQueued = null;
+    }
+  })();
+  return saveInflightQueued;
 }
 
 const stamp = () => new Date().toISOString();
@@ -571,7 +631,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (req.method === "GET" && url.pathname === "/healthz") {
-    return json(res, 200, { status: "ok", agent: AGENT_CMD });
+    return json(res, 200, { status: "ok", agent: AGENT_CMD, model: AGENT_MODEL_IN_USE });
   }
 
   if (req.method === "GET" && url.pathname === "/incidents") {
@@ -622,6 +682,7 @@ const server = http.createServer(async (req, res) => {
         // A resolved notification clears the guard so the next occurrence is
         // investigated immediately instead of waiting out the cooldown.
         inflight.delete(key);
+        await saveInflight();
         incidents.set(id, {
           status: "resolved_ignored",
           startedAt: stamp(),
@@ -655,12 +716,14 @@ const server = http.createServer(async (req, res) => {
       const rec = { status: "investigating", startedAt: stamp(), alert };
       incidents.set(id, rec);
       inflight.set(key, { running: true, lastStarted: Date.now(), incidentId: id });
+      await saveInflight();
       accepted.push({ incidentId: id, firing: true, deduped: false });
       handle(id, alert)
         .catch((e) => log(`${id}: unhandled ${e}`))
         .finally(() => {
           const cur = inflight.get(key);
           if (cur && cur.incidentId === id) inflight.set(key, { running: false, lastStarted: Date.now(), incidentId: id });
+          saveInflight();
         });
     }
 
@@ -674,20 +737,48 @@ const server = http.createServer(async (req, res) => {
     if (!rec) return json(res, 404, { detail: "Incident not found" });
     rec.recovery = await verify(rec.endpoint || "unknown");
     rec.recovered = isRecovered(rec.recovery);
+    // Rebuilding the response here matters: the first build said "pending, not
+    // hot-reloaded" and after a restart that is stale. Without this the verify
+    // path also silently rewrote recovery.json down to two keys, so the artifact
+    // stopped matching response.schema.json after any re-check.
+    rec.response = buildResponse(
+      rec.verdict,
+      { endpoint: rec.endpoint || "unknown" },
+      rec.recovery,
+      rec.writeScope || { outside: [] },
+    );
     try {
       await writeFile(
         `${rec.evidenceDir}/recovery.json`,
-        JSON.stringify({ recovery: rec.recovery, recovered: rec.recovered }, null, 2),
+        JSON.stringify(
+          {
+            recovery: rec.recovery,
+            recovered: rec.recovered,
+            verdict: rec.verdict ? rec.verdict.line : null,
+            response: rec.response,
+            writeScope: {
+              allowPrefix: WRITE_ALLOW_PREFIX,
+              outside: (rec.writeScope || {}).outside || [],
+              touched: (rec.writeScope || {}).touched || [],
+            },
+          },
+          null, 2,
+        ),
       );
     } catch {}
-    log(`${rec.id || verifyRoute[1]}: re-verified recovered=${rec.recovered}`);
-    return json(res, 200, { recovered: rec.recovered, recovery: rec.recovery });
+    log(`${rec.id || verifyRoute[1]}: re-verified recovered=${rec.recovered} status=${rec.response.status}`);
+    return json(res, 200, {
+      recovered: rec.recovered,
+      recovery: rec.recovery,
+      response: rec.response,
+    });
   }
 
   json(res, 404, { detail: "Not found" });
 });
 
 await mkdir(DATA_DIR, { recursive: true });
+loadInflight();
 
 // .env values are interpolated by compose at `up` time, and an ambient shell
 // variable of the same name silently overrides them -- an incident was
@@ -699,6 +790,7 @@ await mkdir(DATA_DIR, { recursive: true });
 {
   const provider = process.env.PI_PROVIDER || "";
   const model = process.env.PI_MODEL || "";
+  AGENT_MODEL_IN_USE = { provider: provider || null, model: model || null };
   if (!provider && model) {
     log(`WARNING: PI_MODEL="${model}" set but PI_PROVIDER unset -- pi silently picks its own default provider`);
   } else if (!provider && !model) {
@@ -706,6 +798,13 @@ await mkdir(DATA_DIR, { recursive: true });
   } else {
     log(`agent model in effect: ${provider}/${model || "(provider default)"}`);
   }
+
+  // entrypoint.sh re-exports PI_PROVIDER/PI_MODEL from ${REPO_DIR}/.env so that
+  // the file an operator edits wins over compose interpolation of an ambient
+  // shell variable. If they still disagree, the entrypoint did not run (someone
+  // overrode ENTRYPOINT, or REPO_DIR points elsewhere) and the container is
+  // running a model the repo never asked for -- which is exactly the failure that
+  // made earlier agent verdicts unattributable (issue #8).
 
   // Compose interpolates ${PI_MODEL} from the process environment FIRST and the
   // .env file only fills gaps, so an ambient export beats the file. This is not
@@ -725,7 +824,7 @@ await mkdir(DATA_DIR, { recursive: true });
     const diff = Object.entries(inFile).filter(([k, v]) => v && v !== process.env[k]);
     if (diff.length) {
       for (const [k, v] of diff) {
-        log(`WARNING: ${k} in effect is "${process.env[k] || "<unset>"}" but ${envFile} says "${v}" -- the .env value is being IGNORED because an ambient environment variable takes precedence in compose interpolation`);
+        log(`WARNING: ${k} in effect is "${process.env[k] || "<unset>"}" but ${envFile} says "${v}" -- entrypoint.sh was expected to make .env win; check that the image's entrypoint is in use and REPO_DIR is mounted`);
       }
     } else if (inFile.PI_MODEL || inFile.PI_PROVIDER) {
       log(`${envFile} agrees with the environment`);

@@ -39,6 +39,27 @@ export PI_CODING_AGENT_SESSION_DIR="${PI_CODING_AGENT_SESSION_DIR:-/tmp/pi-sessi
 export PI_SKIP_VERSION_CHECK=1
 export PI_TELEMETRY=0
 
+# The repository's .env is the file an operator edits, so it has to be what the
+# agent actually runs on. Compose interpolation gives an already-exported shell
+# variable precedence over .env, and on Windows+WSL Windows environment variables
+# leak into WSL, so an old PI_MODEL from an unrelated project quietly replaced the
+# value in .env and the container ran a model nobody selected (issue #8).
+# Re-read the file here and let it win, naming the value it displaced.
+ENV_FILE="${REPO_DIR:-/work/repo}/.env"
+if [ -f "$ENV_FILE" ]; then
+  for key in PI_PROVIDER PI_MODEL; do
+    val=$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$ENV_FILE" | tail -1 | tr -d '\r' | sed "s/^[\"']//; s/[\"']$//")
+    [ -n "$val" ] || continue
+    cur=$(eval "printf %s \"\${$key:-}\"")
+    if [ -n "$cur" ] && [ "$cur" != "$val" ]; then
+      echo "[entrypoint] $key: using \"$val\" from $ENV_FILE, ignoring ambient \"$cur\""
+    fi
+    export "$key=$val"
+  done
+else
+  echo "[entrypoint] note: no $ENV_FILE; PI_PROVIDER/PI_MODEL come from the environment only"
+fi
+
 # Fail fast on a provider/model pair that is not in the mounted models.json.
 # A stale PI_MODEL in .env otherwise shows up only as an opaque agent failure
 # after the alert has already been consumed.
