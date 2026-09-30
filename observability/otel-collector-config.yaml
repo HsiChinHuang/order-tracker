@@ -32,10 +32,11 @@ exporters:
 
   # Loki 3.x serves an OTLP receiver at /otlp/v1/logs on its HTTP port.
   #
-  # Which attributes become stream labels is decided by Loki, not here: the
-  # otlphttp exporter has no logs.attribute_labels key (validated against
-  # otel/opentelemetry-collector-contrib:0.115.1 -- "invalid keys: logs").
-  # Pinning happens in observability/loki-config.yaml. See issue #10.
+  # Which OTLP attributes become Loki index labels is decided by Loki, not here:
+  # the otlphttp exporter has no logs.attribute_labels key (validated against
+  # otel/opentelemetry-collector-contrib:0.115.1 -- "invalid keys: logs"). Loki's
+  # own defaults already keep per-request attributes out of the index; see the
+  # measurements recorded in observability/loki-config.yaml.
   otlphttp/logs:
     endpoint: http://loki:3100/otlp
     tls:
