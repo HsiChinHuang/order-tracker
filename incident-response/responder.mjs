@@ -9,7 +9,7 @@
 // produced empty evidence in the previous version of this service.
 
 import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, readdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import http from "node:http";
@@ -32,6 +32,61 @@ const PROMPT_TEMPLATE = readFileSync(
 );
 
 const incidents = new Map();
+
+// The incidents Map is process memory, but every incident's payload lives on the
+// incidents volume (alert.json, evidence.md, agent_response.md, recovery.json).
+// Before restart the responder answered GET /incidents/<id> with 404 for every
+// incident it had itself created -- the evidence outlived the state describing
+// it. On boot, rebuild the Map from the volume so an incident id stays valid
+// across container restarts.
+async function loadExistingIncidents() {
+  let entries;
+  try {
+    entries = await readdir(DATA_DIR, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const ent of entries.filter((d) => d.isDirectory())) {
+    const name = ent.name;
+    if (incidents.has(name)) continue;
+    const dir = `${DATA_DIR}/${name}`;
+    const read = (f) => {
+      try {
+        return JSON.parse(readFileSync(`${dir}/${f}`, "utf8"));
+      } catch {
+        return null;
+      }
+    };
+    const alert = read("alert.json");
+    const recovery = read("recovery.json");
+    if (!alert && !recovery) continue; // not an incident dir
+    let agentFinished = false;
+    try {
+      agentFinished = readFileSync(`${dir}/agent_response.md`, "utf8").trim().length > 0;
+    } catch {}
+    incidents.set(name, {
+      status: recovery
+        ? recovery.recovered
+          ? "recovered"
+          : "verified_unrecovered"
+        : agentFinished
+          ? "agent_completed"
+          : alert
+            ? "investigating_interrupted"
+            : "unknown",
+      startedAt: alert?.startsAt || null,
+      finishedAt: recovery?.recovery?.checked_at || null,
+      endpoint:
+        alert?.annotations?.endpoint || alert?.labels?.http_route || "unknown",
+      evidenceDir: dir,
+      alert,
+      recovered: recovery?.recovered,
+      recovery: recovery?.recovery,
+      rebuiltFromDisk: true,
+    });
+  }
+}
+await loadExistingIncidents();
 
 // Grafana re-notifies a still-firing alert every repeat_interval, and the policy
 // tree here uses 1m so the loop is observable in one sitting. Without this guard
@@ -415,6 +470,33 @@ const server = http.createServer(async (req, res) => {
 });
 
 await mkdir(DATA_DIR, { recursive: true });
+
+// .env values are interpolated by compose at `up` time, and an ambient shell
+// variable of the same name silently overrides them -- an incident was
+// investigated with a model nobody chose because a stale export beat the .env
+// line. entrypoint.sh validates the pair against models.json (and hard-fails on
+// a mismatch when both are set), but that value is not in the responder's own
+// log. Echo the pair actually in effect, loudly, and flag an unset provider so
+// "which model fixed my incident?" is answerable from the container log alone.
+{
+  const provider = process.env.PI_PROVIDER || "";
+  const model = process.env.PI_MODEL || "";
+  if (!provider && model) {
+    log(`WARNING: PI_MODEL="${model}" set but PI_PROVIDER unset -- pi silently picks its own default provider`);
+  } else if (!provider && !model) {
+    log("WARNING: PI_PROVIDER/PI_MODEL unset -- pi uses ambient defaults; .env or the compose environment should pin the agent model");
+  } else {
+    log(`agent model in effect: ${provider}/${model || "(provider default)"}`);
+  }
+  let hasCfg = false;
+  try {
+    JSON.parse(readFileSync(`${process.env.PI_CODING_AGENT_DIR || "/root/.pi/agent"}/models.json`, "utf8"));
+    hasCfg = true;
+  } catch {}
+  log(`models.json visible to agent: ${hasCfg ? "yes" : "NO -- agent calls will fail to authenticate"}`);
+  log(`incidents rebuilt from ${DATA_DIR}: ${incidents.size}`);
+}
+
 server.listen(PORT, "0.0.0.0", () =>
   log(`listening on :${PORT} agent=${AGENT_CMD} repo=${REPO_DIR}`),
 );
