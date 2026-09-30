@@ -488,6 +488,34 @@ await mkdir(DATA_DIR, { recursive: true });
   } else {
     log(`agent model in effect: ${provider}/${model || "(provider default)"}`);
   }
+
+  // Compose interpolates ${PI_MODEL} from the process environment FIRST and the
+  // .env file only fills gaps, so an ambient export beats the file. This is not
+  // hypothetical: on this machine a Windows user environment variable sets
+  // PI_MODEL=Qwen3.8-Flash-Next-Thinking while .env says
+  // Qwen3.6-35B-A3B-Instruct, and the container had been quietly using the
+  // ambient one. The repo checkout is mounted at REPO_DIR, so compare against
+  // the file the operator actually edited and say so when they disagree.
+  const envFile = `${REPO_DIR}/.env`;
+  try {
+    const txt = readFileSync(envFile, "utf8");
+    const pick = (k) => {
+      const m = txt.match(new RegExp(`^${k}=(.*)$`, "m"));
+      return m ? m[1].trim() : "";
+    };
+    const inFile = { PI_PROVIDER: pick("PI_PROVIDER"), PI_MODEL: pick("PI_MODEL") };
+    const diff = Object.entries(inFile).filter(([k, v]) => v && v !== process.env[k]);
+    if (diff.length) {
+      for (const [k, v] of diff) {
+        log(`WARNING: ${k} in effect is "${process.env[k] || "<unset>"}" but ${envFile} says "${v}" -- the .env value is being IGNORED because an ambient environment variable takes precedence in compose interpolation`);
+      }
+    } else if (inFile.PI_MODEL || inFile.PI_PROVIDER) {
+      log(`${envFile} agrees with the environment`);
+    }
+  } catch {
+    log(`note: no ${envFile} to cross-check the agent model against`);
+  }
+
   let hasCfg = false;
   try {
     JSON.parse(readFileSync(`${process.env.PI_CODING_AGENT_DIR || "/root/.pi/agent"}/models.json`, "utf8"));
