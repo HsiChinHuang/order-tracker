@@ -267,8 +267,16 @@ function runAgent(prompt) {
 // Does the incident still reproduce? This is the recovery check the runbook
 // needs; it is deliberately separate from the agent's own claim. The app is not
 // hot-reloading, so an edit made by the agent only takes effect after
-// `docker compose restart app` — check=false right after the agent finishes is
-// expected and is why this is re-runnable through POST /incidents/{id}/verify.
+// `docker compose restart app` -- recovered=false right after the agent finishes
+// is expected, which is why this is re-runnable through POST /incidents/{id}/verify.
+//
+// The distinction that matters is between a 5xx (incident continues) and a probe
+// that got no answer at all. Status 0 means the request never completed: DNS
+// failure, connection refused, timeout. Treating that as "not >= 500, therefore
+// recovered" was a real bug -- caught by the fixture run, where APP_BASE_URL
+// pointed at an unresolvable host and the responder reported recovered=true with
+// all three probes at status 0, i.e. it certified recovery for an app it could
+// not reach. Only a real 2xx/3xx response counts as evidence of health.
 async function verify(endpoint) {
   if (!endpoint.includes("{")) return { verified: false, note: "no route template" };
   const results = [];
@@ -278,12 +286,188 @@ async function verify(endpoint) {
     results.push({ url, status: r.http });
   }
   const failing = results.filter((r) => r.status >= 500);
+  const unreachable = results.filter((r) => r.status === 0 || r.status >= 600 || r.status < 200);
   return {
     verified: true,
     results,
     still_failing: failing,
+    // Non-empty means the check itself could not be performed. Callers must treat
+    // this as UNKNOWN, never as recovery.
+    unreachable,
+    indeterminate: failing.length === 0 && unreachable.length > 0,
     checked_at: stamp(),
   };
+}
+
+// The agent gets read,grep,find,ls,edit and nothing else, and the image ships
+// only node (no git, curl, docker, python3 -- verified in the running container).
+// So nothing inside the agent can enforce a write boundary: it is a prompt
+// instruction, and prompt instructions get ignored. The responder can, though,
+// look at the filesystem afterwards and say what actually changed. That is the
+// real enforcement point: detect, record, refuse to call it recovered.
+//
+// PRUNE_DIRS are skipped because they are dependency/VCS churn the agent is not
+// expected to touch and scanning them would swamp the signal. Anything outside
+// this list IS watched, including files the agent creates at the repo root.
+// .git is pruned, so this audits the working tree, not commits: an agent with no
+// git binary cannot commit, but it also means the audit must not be described as
+// catching git history changes.
+const PRUNE_DIRS = new Set([
+  ".git",
+  ".venv",
+  "node_modules",
+  "__pycache__",
+  ".pi",
+  "data",
+  ".pytest_cache",
+]);
+const WRITE_ALLOW_PREFIX = "app/";
+
+async function snapshotTree(root) {
+  const { stat } = await import("node:fs/promises");
+  const out = new Map();
+  const walk = async (dir, rel) => {
+    let ents;
+    try {
+      ents = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return; // unreadable directory: skip, does not invalidate the rest
+    }
+    for (const e of ents) {
+      if (PRUNE_DIRS.has(e.name)) continue;
+      const abs = `${dir}/${e.name}`;
+      const relPath = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        await walk(abs, relPath);
+      } else if (e.isFile()) {
+        try {
+          const s = await stat(abs);
+          out.set(relPath, `${s.size}:${Math.round(s.mtimeMs)}`);
+        } catch {}
+      }
+    }
+  };
+  await walk(root, "");
+  return out;
+}
+
+function diffTrees(before, after) {
+  const changed = [];
+  const added = [];
+  const removed = [];
+  for (const [p, sig] of after) {
+    if (!before.has(p)) added.push(p);
+    else if (before.get(p) !== sig) changed.push(p);
+  }
+  for (const p of before.keys()) if (!after.has(p)) removed.push(p);
+  return { changed, added, removed };
+}
+
+function classifyWriteScope(diff) {
+  const touched = [...diff.changed, ...diff.added, ...diff.removed];
+  const outside = touched.filter((p) => !p.startsWith(WRITE_ALLOW_PREFIX));
+  return { allowed: touched.filter((p) => p.startsWith(WRITE_ALLOW_PREFIX)), outside, touched };
+}
+
+// The contract the agent actually satisfies is one VERDICT line at the end of
+// agent_response.md, not a JSON object -- it has no tool that could emit and
+// validate JSON, and response.schema.json was never read by anything. Parse the
+// line and build the schema object here, so the schema describes what the
+// responder produces instead of what nobody sends.
+function parseVerdict(text) {
+  const lines = String(text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = lines[i].match(/^VERDICT:\s*(fixed|no-action|needs-human)\s*-\s*(.+)$/i);
+    if (m) {
+      const kind = m[1].toLowerCase();
+      return { kind, reason: m[2].trim(), line: lines[i], lineFromEnd: lines.length - 1 - i };
+    }
+  }
+  return null;
+}
+
+// One place that decides status, from three inputs: what the agent claimed, what
+// it actually touched, and what the probes measured. The ordering encodes the
+// precedence -- an agent that wrote outside app/ cannot be trusted to have fixed
+// anything regardless of its verdict, and an agent asking for a human is escalated
+// whether or not the probes happen to look healthy.
+function buildResponse(verdict, evidence, recovery, scope) {
+  const base = {
+    summary: "",
+    root_cause: "not stated by the agent",
+    action: "escalate",
+    status: "escalated",
+    details: "",
+  };
+  if (!verdict) {
+    return {
+      ...base,
+      summary: "Agent finished without a VERDICT line; outcome unknown.",
+      details:
+        "The prompt requires a final 'VERDICT: <fixed|no-action|needs-human> - <cause>' line. " +
+        "It was absent, so no outcome can be attributed to this run.",
+    };
+  }
+  const cause = verdict.reason;
+  if (scope && scope.outside.length) {
+    return {
+      ...base,
+      summary: `${evidence.endpoint}: agent wrote outside ${WRITE_ALLOW_PREFIX} and its fix is not trusted.`,
+      root_cause: cause,
+      details: `${verdict.line} | out-of-scope files: ${scope.outside.join(", ")}`,
+    };
+  }
+  if (verdict.kind === "needs-human") {
+    return { ...base, summary: `${evidence.endpoint}: ${cause}`, root_cause: cause, details: verdict.line };
+  }
+  const healthy = isRecovered(recovery);
+  if (verdict.kind === "fixed") {
+    const why = recoveryProblem(recovery);
+    return {
+      summary: `${evidence.endpoint}: ${cause}`,
+      root_cause: cause,
+      action: "fix",
+      status: healthy ? "resolved" : "pending",
+      details: healthy ? verdict.line : `${verdict.line} | ${why}`,
+      fix_commit_message: `fix(app): ${cause}`,
+    };
+  }
+  // no-action: the agent believes the alert was wrong.
+  const why = recoveryProblem(recovery);
+  return {
+    summary: `${evidence.endpoint}: ${cause}`,
+    root_cause: cause,
+    action: "false_positive",
+    status: healthy ? "resolved" : "pending",
+    details: healthy ? verdict.line : `${verdict.line} | ${why}`,
+  };
+}
+
+// Spelled out because "pending" without a reason is what made the old runbook
+// untrustworthy: the reader could not tell a restart away from a dead app.
+function recoveryProblem(recovery) {
+  if (!recovery || !recovery.verified) return "recovery could not be checked";
+  const bad = (recovery.still_failing || []).length;
+  const dark = (recovery.unreachable || []).length;
+  const parts = [];
+  if (bad) parts.push(`${bad} probe(s) still 5xx`);
+  if (dark) parts.push(`${dark} probe(s) returned no HTTP response`);
+  parts.push(
+    "the app does not hot-reload; restart it and re-check with POST /incidents/<id>/verify",
+  );
+  return parts.join(", ");
+}
+
+// Single definition of "the incident is over": the check ran, nothing answered
+// 5xx, AND nothing failed to answer. Used by the response object, the record and
+// the API so the three can never disagree.
+function isRecovered(recovery) {
+  return Boolean(
+    recovery &&
+      recovery.verified &&
+      (recovery.still_failing || []).length === 0 &&
+      (recovery.unreachable || []).length === 0,
+  );
 }
 
 async function handle(incidentId, alert) {
@@ -306,6 +490,11 @@ async function handle(incidentId, alert) {
         annotations: alert.annotations,
       })}\nRepository to fix: ${REPO_DIR}`;
 
+    // Snapshot before the agent runs so the write-scope audit below has a
+    // baseline. The tree is a live Windows bind mount, so unrelated host edits
+    // could otherwise be attributed to the agent.
+    const before = await snapshotTree(REPO_DIR);
+
     const agent = await runAgent(prompt);
     rec.agent = agent;
     rec.status = agent.ok ? "agent_completed" : "agent_failed";
@@ -314,13 +503,42 @@ async function handle(incidentId, alert) {
       agent.output || `# No output\n\n${agent.error || "agent produced nothing"}`,
     );
 
+    const after = await snapshotTree(REPO_DIR);
+    const diff = diffTrees(before, after);
+    const scope = classifyWriteScope(diff);
+    rec.writeScope = scope;
+    await writeFile(
+      `${dir}/write-scope.json`,
+      JSON.stringify({ allowPrefix: WRITE_ALLOW_PREFIX, ...diff, ...scope }, null, 2),
+    );
+    if (scope.outside.length) {
+      rec.status = "agent_out_of_scope";
+      log(`${incidentId}: OUT OF SCOPE writes outside ${WRITE_ALLOW_PREFIX}: ${scope.outside.join(", ")}`);
+    } else {
+      log(`${incidentId}: agent wrote only under ${WRITE_ALLOW_PREFIX} (${scope.allowed.length} file(s))`);
+    }
+
+    const verdict = parseVerdict(agent.output);
+    rec.verdict = verdict;
+
     rec.recovery = await verify(rec.endpoint || "unknown");
-    rec.recovered = rec.recovery.verified && rec.recovery.still_failing.length === 0;
+    rec.recovered = isRecovered(rec.recovery);
+    const response = buildResponse(verdict, evidence, rec.recovery, scope);
+    rec.response = response;
     await writeFile(
       `${dir}/recovery.json`,
-      JSON.stringify({ recovery: rec.recovery, recovered: rec.recovered }, null, 2),
+      JSON.stringify(
+        {
+          recovery: rec.recovery,
+          recovered: rec.recovered,
+          verdict: verdict ? verdict.line : null,
+          response,
+          writeScope: { allowPrefix: WRITE_ALLOW_PREFIX, outside: scope.outside, touched: scope.touched },
+        },
+        null, 2,
+      ),
     );
-    log(`${incidentId}: agent ${rec.status}, recovered=${rec.recovered}`);
+    log(`${incidentId}: agent ${rec.status}, verdict=${verdict ? verdict.kind : "MISSING"}, recovered=${rec.recovered}`);
   } catch (e) {
     rec.status = "error";
     rec.error = `${e.name}: ${e.message}`;
@@ -455,7 +673,7 @@ const server = http.createServer(async (req, res) => {
     const rec = incidents.get(verifyRoute[1]);
     if (!rec) return json(res, 404, { detail: "Incident not found" });
     rec.recovery = await verify(rec.endpoint || "unknown");
-    rec.recovered = rec.recovery.verified && rec.recovery.still_failing.length === 0;
+    rec.recovered = isRecovered(rec.recovery);
     try {
       await writeFile(
         `${rec.evidenceDir}/recovery.json`,

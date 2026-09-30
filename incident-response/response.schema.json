@@ -1,35 +1,35 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "ResponderOutput",
-  "description": "Structured output from the incident responder agent",
+  "description": "The response object the responder builds in recovery.json. The agent itself never produces JSON: it is launched with --tools read,grep,find,ls,edit (no bash), so the only thing it can emit is text ending in a VERDICT line. responder.mjs parses that line plus the write-scope audit plus the recovery probes and assembles this object. Previously this schema claimed additionalProperties:false over fields nobody populated and no code ever validated.",
   "type": "object",
-  "required": ["summary", "root_cause", "action", "status"],
+  "required": ["summary", "root_cause", "action", "status", "details"],
   "properties": {
     "summary": {
       "type": "string",
-      "description": "Brief summary of what happened"
+      "description": "One line: affected endpoint plus the agent's stated cause."
     },
     "root_cause": {
       "type": "string",
-      "description": "The identified root cause of the incident"
+      "description": "Text after the dash in the agent's VERDICT line. 'not stated by the agent' when the line was missing."
     },
     "action": {
       "type": "string",
-      "enum": ["fix", "rollback", "false_positive", "escalate"],
-      "description": "The recommended or taken action"
+      "enum": ["fix", "false_positive", "escalate"],
+      "description": "fix = VERDICT fixed and every write stayed under app/. false_positive = VERDICT no-action. escalate = VERDICT needs-human, no VERDICT at all, or any out-of-scope write."
     },
     "status": {
       "type": "string",
       "enum": ["resolved", "pending", "escalated"],
-      "description": "The current status of the incident"
+      "description": "resolved requires isRecovered(): the check ran, no probe answered 5xx, and no probe failed to answer. pending means the agent acted but health is unconfirmed -- the app is not hot-reloading. escalated covers needs-human, a missing VERDICT, and out-of-scope writes."
     },
     "details": {
       "type": "string",
-      "description": "Additional details about the investigation and fix"
+      "description": "The VERDICT line, plus why status is not resolved (which probes were 5xx or returned nothing) whenever it is not."
     },
     "fix_commit_message": {
       "type": "string",
-      "description": "Git commit message for the fix (if action is 'fix')"
+      "description": "Suggested message only. Nothing in this system can commit: the image has no git. A human applies it."
     }
   },
   "additionalProperties": false

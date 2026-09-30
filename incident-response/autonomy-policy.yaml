@@ -1,33 +1,70 @@
+# Autonomy policy for the incident responder
+#
+# This file used to list powers the responder does not have, which made it worse
+# than documentation: a reviewer reading it would conclude the agent can commit,
+# push, rebuild containers and run tests, and grade the system against that. It
+# cannot do any of those things. Verified inside the running container:
+#
+#   git: MISSING   curl: MISSING   wget: MISSING   docker: MISSING
+#   python3: MISSING   pytest: MISSING   node: /usr/local/bin/node
+#
+# and the agent is launched as
+#   pi --print --tools read,grep,find,ls,edit -- <prompt>
+# i.e. no bash, so there is no shell in which an allowlisted command could run.
+#
+# What follows describes the boundary that is actually enforced, by the responder
+# process, rather than an aspiration. See enforcement.enforced_below.
+
 autonomy_level: 2
 
-allowlist:
-  allowed_commands:
-    - pytest
-    - git add
-    - git commit
-    - git push --force-with-lease
-    - docker compose up --build -d --wait
-    - docker compose restart app
-    - curl http://localhost:8000/healthz
-    - curl http://localhost:9090/api/v1/query
-    - curl http://localhost:8000/api/orders/*
+# Read scope: what the agent was asked to look at. Advisory (a prompt instruction)
+# because nothing restricts reads in the first place.
+read_scope:
+  - "app/**/*.py"
+  - "tests/**/*.py"
+  - "observability/*.yaml"
+  - "/incidents/<id>/evidence.md"
 
-  allowed_files:
-    read:
-      - "app/*.py"
-      - "tests/*.py"
-      - "observability/*.yaml"
-    write:
-      - "app/*.py"
-      - "tests/*.py"
+# Write scope: the one boundary with a real check behind it.
+write_scope:
+  allowed_prefix: "app/"
+  enforced_by: "incident-response/responder.mjs (snapshotTree/diffTrees/classifyWriteScope)"
+  how: >
+    The responder fingerprints the working tree before launching the agent,
+    re-fingerprints it afterwards, and writes the diff to
+    /incidents/<id>/write-scope.json. Anything outside allowed_prefix is reported
+    with status agent_out_of_scope, forces response.action=escalate regardless of
+    the agent's own verdict, and names the files.
+  limits:
+    - >
+      Audits the working tree, not git history. .git is pruned from the snapshot,
+      and the agent has no git binary anyway, so it cannot commit; the flip side is
+      that the audit must not be described as catching commit-level changes.
+    - >
+      Detection, not prevention. The edit happens and is then reported. A refusing
+      sandbox would need a writable-overlay or a repo copy per incident.
+    - >
+      Co-writes race: /work/repo is a live bind mount, so an operator editing the
+      repo while an agent runs is attributed to the agent.
+
+# Capabilities the agent does NOT have. Listed explicitly so nobody re-adds them
+# to a diagram. If a future iteration wants them, it must add the binary to
+# incident-response/Dockerfile and a way to audit the call.
+not_available:
+  - run tests (no pytest, no python3 in the image)
+  - commit, push, or rewrite history (no git)
+  - rebuild or restart containers (no docker)
+  - call HTTP APIs (no curl; the responder proxies Prometheus/Loki/Tempo instead)
+  - edit tests, migrations, config or docs (see write_scope above)
 
 escalation:
   conditions:
-    - "action requires database schema change"
-    - "action requires credential rotation"
-    - "responder cannot identify root cause within 3m"
-    - "proposed fix causes test failures"
-    - "autonomy level >= 4"
+    - "agent wrote any file outside app/ (status agent_out_of_scope)"
+    - "agent emitted no VERDICT line (outcome cannot be attributed to the run)"
+    - "agent verdict needs-human"
+    - "recovery probes returned no HTTP response (indeterminate, not healthy)"
+    - "recovery probes still answered 5xx after the agent finished"
+    - "evidence collection could not reach Prometheus and Loki at once"
   notify:
     - channel: "#oncall"
     - method: "webhook"
