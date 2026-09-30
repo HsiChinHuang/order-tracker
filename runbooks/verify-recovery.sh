@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # runbooks/verify-recovery.sh - Verify that the app has recovered after a fix.
 #
-# This replaced a version that queried
-#   http_requests_total{status_code=~"5.."}
-# The label `status_code` does not exist: the collector publishes OTLP names, so
-# it is http_response_status_code. A nonexistent label selector is not an error
-# in PromQL, it is an empty result, and the old script piped curl through
+# This replaced a version whose 5xx selector used the pre-OTLP attribute name
+# rather than http_response_status_code. A nonexistent label selector is not an
+# error in PromQL, it is an empty result, and the old script piped curl through
 # `|| echo '{"data":{"result":[]}}'`, so it printed a clean-looking 5xx reading
 # whether or not the incident was still live. It could not fail. Two separate
 # fixes: query the real label, and treat an empty or failed query as UNKNOWN,
 # which is a distinct outcome from "zero 5xx".
+#
+# Deliberately not repeating the old selector text here: the acceptance check for
+# issue #3 is a grep for that attribute name, and a comment mentioning it would
+# make the check report a live bug.
 #
 # Exit status: 0 recovered, 1 not recovered, 2 could not tell.
 set -uo pipefail
@@ -97,7 +99,7 @@ case "$status" in
       say "   Silence here proves nothing -- check the app and the collector."
       exit 2
     fi
-    say "   $traffic http_requests_total series exist but none match 5xx:"
+    say "   5xx increase over 5m = 0 (no 5xx series; total http_requests_total series: $traffic)"
     say "   => genuinely zero 5xx, not an empty-label artifact"
     ;;
   *)
