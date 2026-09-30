@@ -15,6 +15,7 @@ import { join } from "node:path";
 import {
   parseVerdict,
   isRecovered,
+  statusAfterVerify,
   classifyWriteScope,
   diffTrees,
   snapshotTreeForTests,
@@ -167,6 +168,15 @@ test("snapshotTree prunes .git and other churn, and catches root files", async (
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("statusAfterVerify is one definition, used live and on rebuild (issue #12)", () => {
+  // The bug: only the boot rebuild derived these two statuses, so GET /incidents
+  // said agent_completed for an incident that had been verified minutes earlier,
+  // and the answer flipped to "recovered" only after a restart.
+  assert.equal(statusAfterVerify(true), "recovered");
+  assert.equal(statusAfterVerify(false), "verified_unrecovered");
+  assert.notEqual(statusAfterVerify(true), "agent_completed");
 });
 
 test("importing responder.mjs does not start the HTTP server", () => {

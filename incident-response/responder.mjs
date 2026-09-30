@@ -82,9 +82,7 @@ async function loadExistingIncidents() {
     const writeScope = read("write-scope.json");
     incidents.set(name, {
       status: recovery
-        ? recovery.recovered
-          ? "recovered"
-          : "verified_unrecovered"
+        ? statusAfterVerify(Boolean(recovery.recovered))
         : agentFinished
           ? "agent_completed"
           : alert
@@ -533,6 +531,15 @@ export function isRecovered(recovery) {
   );
 }
 
+// One definition of the status a verified incident reports, shared by the
+// POST /verify handler and loadExistingIncidents() (issue #12): previously only
+// the rebuild derived a status from recovery.json, so a verified incident stayed
+// "agent_completed" until a restart changed it -- the same on-disk state
+// answered two different statuses depending on process uptime.
+export function statusAfterVerify(recovered) {
+  return recovered ? "recovered" : "verified_unrecovered";
+}
+
 async function handle(incidentId, alert) {
   const rec = incidents.get(incidentId);
   try {
@@ -741,6 +748,11 @@ export const server = http.createServer(async (req, res) => {
     if (!rec) return json(res, 404, { detail: "Incident not found" });
     rec.recovery = await verify(rec.endpoint || "unknown");
     rec.recovered = isRecovered(rec.recovery);
+    // Issue #12: update the status in the same breath as the flag. Before this,
+    // only the boot rebuild derived recovered/verified_unrecovered from
+    // recovery.json, so GET /incidents reported agent_completed for a verified
+    // incident until some later restart changed the answer.
+    rec.status = statusAfterVerify(rec.recovered);
     // Rebuilding the response here matters: the first build said "pending, not
     // hot-reloaded" and after a restart that is stale. Without this the verify
     // path also silently rewrote recovery.json down to two keys, so the artifact
