@@ -17,9 +17,10 @@ What is in the evidence directory:
 
 After you finish, the responder writes two more files there that record what you
 actually did, not what you said: `write-scope.json` (a before/after diff of the
-repository) and `recovery.json` (fresh probes of the endpoint). Anything you
-change outside `app/` shows up in `write-scope.json` under `outside` and forces
-the incident to escalate, even if your verdict says `fixed`.
+repository) and `recovery.json` (fresh probes of the endpoint). Your own output is
+saved as `agent_response.md`. Anything you change outside `app/` shows up in
+`write-scope.json` under `outside` and forces the incident to escalate, even if
+your verdict says `fixed`.
 
 Rules:
 

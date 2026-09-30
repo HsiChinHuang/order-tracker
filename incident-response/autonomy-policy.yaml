@@ -68,3 +68,10 @@ escalation:
   notify:
     - channel: "#oncall"
     - method: "webhook"
+
+# What an audited run leaves on the incidents volume, so a reviewer can check this
+# policy against files rather than against claims:
+#   /incidents/<id>/evidence.md        what the responder measured before the agent ran
+#   /incidents/<id>/agent_response.md  the agent's text, expected to end in VERDICT:
+#   /incidents/<id>/write-scope.json   what the agent actually changed
+#   /incidents/<id>/recovery.json      probes + the verdict/action/status decision

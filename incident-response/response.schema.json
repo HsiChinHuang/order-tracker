@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "ResponderOutput",
-  "description": "The response object the responder builds in recovery.json. The agent itself never produces JSON: it is launched with --tools read,grep,find,ls,edit (no bash), so the only thing it can emit is text ending in a VERDICT line. responder.mjs parses that line plus the write-scope audit plus the recovery probes and assembles this object. Previously this schema claimed additionalProperties:false over fields nobody populated and no code ever validated.",
+  "description": "The response object the responder writes into recovery.json. Inputs: the VERDICT line at the end of agent_response.md, the file diff recorded in write-scope.json, and the endpoint probes recorded alongside this object. The agent itself never produces JSON: it is launched with --tools read,grep,find,ls,edit (no bash), so the only thing it can emit is text, and the evidence it was given lives in evidence.md. Previously this schema claimed additionalProperties:false over fields nobody populated and no code ever validated.",
   "type": "object",
   "required": ["summary", "root_cause", "action", "status", "details"],
   "properties": {
